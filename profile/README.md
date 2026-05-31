@@ -3,7 +3,6 @@
 > **Financial infrastructure for Brazilian fintechs, starting with trust.**
 
 [![Website](https://img.shields.io/badge/website-swepay.co-1e2327)](https://swepay.co)
-[![Docs](https://img.shields.io/badge/docs-docs.swepay.co-1e2327)](https://docs.swepay.co)
 [![AWS Marketplace](https://img.shields.io/badge/AWS%20Marketplace-CA%20Manager-FF9900)](https://aws.amazon.com/marketplace/pp/prodview-q4fypw6qrmayo)
 
 Swepay builds the identity, certificate, and authentication layers that regulated Brazilian fintechs use to integrate partners, ship products, and operate at regulatory scale — delivered as APIs, so platform teams stop stitching vendors together with glue code.
