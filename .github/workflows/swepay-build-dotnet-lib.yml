@@ -1,0 +1,218 @@
+name: Swepay Build .NET Library (reusable)
+
+# Reusable workflow consumed by every native-* / dotnet-*-template .NET library.
+# Implements F-X-1 from GAPS_ROADMAP.md: centralizes build + test + coverage + pack +
+# security-scan + (future) sign + SBOM so each repo's dotnet.yml is a thin caller.
+#
+# Usage from a consumer repo (.github/workflows/dotnet.yml):
+#
+#   jobs:
+#     build:
+#       uses: swepay/.github/.github/workflows/swepay-build-dotnet-lib.yml@v1
+#       with:
+#         dotnet-version: "10.0.x"
+#         package-projects: "src/NativeMediator/NativeMediator.csproj"
+#         coverage-paths: "./tests/**/coverage.cobertura.xml"
+#         run-aot-smoke: false
+#         aot-project: ""
+#       secrets:
+#         NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+#         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        description: ".NET SDK version to install"
+        required: false
+        type: string
+        default: "10.0.x"
+      solution-file:
+        description: "Optional .sln/.slnx path; if empty, dotnet restore discovers automatically"
+        required: false
+        type: string
+        default: ""
+      package-projects:
+        description: "Space-separated list of .csproj paths to pack and (conditionally) publish"
+        required: false
+        type: string
+        default: ""
+      coverage-paths:
+        description: "Glob for coverage files (Cobertura XML) to upload to codecov"
+        required: false
+        type: string
+        default: "./tests/**/coverage.cobertura.xml"
+      run-aot-smoke:
+        description: "If true, runs dotnet publish with PublishAot=true against aot-project"
+        required: false
+        type: boolean
+        default: false
+      aot-project:
+        description: "Path to csproj used for AOT smoke test (required if run-aot-smoke=true)"
+        required: false
+        type: string
+        default: ""
+      fail-on-vulnerable-severity:
+        description: "Minimum severity that fails CI: Low | Moderate | High | Critical"
+        required: false
+        type: string
+        default: "High"
+    secrets:
+      NUGET_API_KEY:
+        description: "NuGet.org API key for publishing on v* tag"
+        required: false
+      CODECOV_TOKEN:
+        description: "Codecov upload token (optional for public repos)"
+        required: false
+
+concurrency:
+  group: swepay-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: |
+          if [ -n "${{ inputs.solution-file }}" ]; then
+            dotnet restore "${{ inputs.solution-file }}"
+          else
+            dotnet restore
+          fi
+
+      - name: Build
+        run: |
+          if [ -n "${{ inputs.solution-file }}" ]; then
+            dotnet build "${{ inputs.solution-file }}" --no-restore --configuration Release
+          else
+            dotnet build --no-restore --configuration Release
+          fi
+
+      - name: Test (with coverage)
+        run: dotnet test --no-build --configuration Release --verbosity normal --collect:"XPlat Code Coverage"
+
+      - name: Upload coverage to Codecov
+        if: inputs.coverage-paths != ''
+        uses: codecov/codecov-action@v4
+        with:
+          files: ${{ inputs.coverage-paths }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: AOT smoke test (optional)
+        if: inputs.run-aot-smoke && inputs.aot-project != ''
+        run: |
+          dotnet publish "${{ inputs.aot-project }}" \
+            --configuration Release \
+            --runtime linux-x64 \
+            /p:PublishAot=true \
+            /p:PublishTrimmed=true \
+            /p:TrimMode=full
+
+      - name: Pack NuGet packages
+        if: inputs.package-projects != ''
+        run: |
+          mkdir -p ./nupkg
+          for proj in ${{ inputs.package-projects }}; do
+            dotnet pack "$proj" --no-build --configuration Release --output ./nupkg
+          done
+
+      - name: Upload pack artifacts
+        if: inputs.package-projects != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: ./nupkg/*.nupkg
+          retention-days: 7
+
+  security-scan:
+    name: Security scan (vulnerable packages)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Scan for vulnerable packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTPUT=$(dotnet list package --vulnerable --include-transitive 2>&1 || true)
+          echo "$OUTPUT"
+          SEV="${{ inputs.fail-on-vulnerable-severity }}"
+          case "$SEV" in
+            Critical) PATTERN='>\s*Critical\s*\|' ;;
+            High)     PATTERN='>\s*(High|Critical)\s*\|' ;;
+            Moderate) PATTERN='>\s*(Moderate|High|Critical)\s*\|' ;;
+            Low)      PATTERN='>\s*(Low|Moderate|High|Critical)\s*\|' ;;
+            *)        PATTERN='>\s*(High|Critical)\s*\|' ;;
+          esac
+          if echo "$OUTPUT" | grep -E "$PATTERN" ; then
+            echo "::error::Vulnerabilities at or above severity '$SEV' detected"
+            exit 1
+          fi
+
+  publish:
+    name: Publish to NuGet (tags only)
+    needs: [build, security-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Download pack artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: ./nupkg
+
+      - name: Push to NuGet.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::error::NUGET_API_KEY secret is required to publish"
+            exit 1
+          fi
+          for pkg in ./nupkg/*.nupkg; do
+            dotnet nuget push "$pkg" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
